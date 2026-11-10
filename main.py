@@ -6,6 +6,7 @@ Deploy:        Vercel detects `app` in main.py (set the project root to backend/
 Env:
   ALLOWED_ORIGINS   comma-separated frontend origins for CORS
                     (default: http://localhost:5199). Use "*" to allow any.
+  DATASET_TTL_SECONDS  how often cities/rent/country data is re-pulled (default 3600).
   API_CONTACT       URL or email put in the User-Agent sent to upstream APIs
                     (Wikimedia blocks clients that don't identify themselves).
   GITHUB_TOKEN      optional; raises the GitHub search rate limit.
@@ -15,6 +16,7 @@ Env:
 """
 
 import os
+import time
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -58,8 +60,17 @@ async def cities(response: Response):
         data = await sources.get_cities()
     except Exception as e:
         raise _upstream_error("City data", e)
-    _cdn(response, sources.DAY)
+    # The frontend adds a cache-busting `t` whenever /api/status reports newer data, so a
+    # given URL always maps to one dataset version and can be cached by browser and CDN.
+    _cdn(response, sources.DATASET_TTL, browser=60)
     return data
+
+
+@app.get("/api/status")
+async def status(response: Response):
+    """When each upstream was last pulled and how often it refreshes. Polled by the frontend."""
+    response.headers["Cache-Control"] = "public, max-age=10, s-maxage=15"
+    return {"now": int(time.time()), "sources": sources.status()}
 
 
 @app.get("/api/rent/history")

@@ -258,8 +258,13 @@ async def _build_dataset() -> dict[str, Any]:
     }
 
 
+# How often the city dataset is re-pulled from GeoNames, Zillow and the World Bank.
+# GeoNames republishes daily and Zillow monthly, so anything under an hour re-downloads identical files.
+DATASET_TTL = int(os.getenv("DATASET_TTL_SECONDS", HOUR))
+
+
 async def _dataset() -> dict[str, Any]:
-    return await cache.get("dataset", DAY, _build_dataset)
+    return await cache.get("dataset", DATASET_TTL, _build_dataset)
 
 
 async def get_cities() -> dict[str, Any]:
@@ -369,6 +374,30 @@ FEEDS: dict[str, tuple[Callable[[], Awaitable[Any]], int, int]] = {
 async def get_feed(name: str) -> Any:
     loader, ttl, _ = FEEDS[name]
     return await cache.get(f"feed:{name}", ttl, loader)
+
+
+_FEED_INFO = {
+    "earthquakes": ("Earthquakes", "USGS"),
+    "events": ("Wildfires, storms, volcanoes", "NASA EONET"),
+    "aurora": ("Aurora forecast", "NOAA SWPC"),
+    "aircraft": ("Aircraft", "OpenSky Network"),
+    "satellites": ("ISS + Starlink orbits", "CelesTrak"),
+    "cables": ("Submarine cables", "TeleGeography"),
+}
+
+
+def status() -> list[dict[str, Any]]:
+    """When each upstream was last pulled by this server instance, and how often it is re-pulled."""
+    def row(key: str, label: str, upstream: str, ttl: int) -> dict[str, Any]:
+        age = cache.age(key)
+        return {
+            "id": key, "label": label, "upstream": upstream, "refreshSeconds": ttl,
+            "ageSeconds": None if age is None else round(age),
+            "fetchedAt": None if age is None else round(time.time() - age),
+        }
+    return [row("dataset", "Cities, population, rent", "GeoNames · Zillow · World Bank", DATASET_TTL)] + [
+        row(f"feed:{name}", *_FEED_INFO[name], FEEDS[name][1]) for name in FEEDS
+    ]
 
 
 # ───────────────────────── Per-city profile ─────────────────────────
