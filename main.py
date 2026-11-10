@@ -3,31 +3,22 @@
 Run locally:   uvicorn main:app --reload --port 8000
 Deploy:        Vercel detects `app` in main.py (set the project root to backend/).
 
-Env:
-  ALLOWED_ORIGINS   comma-separated frontend origins for CORS
-                    (default: http://localhost:5199). Use "*" to allow any.
-  DATASET_TTL_SECONDS  how often cities/rent/country data is re-pulled (default 3600).
-  API_CONTACT       URL or email put in the User-Agent sent to upstream APIs
-                    (Wikimedia blocks clients that don't identify themselves).
-  GITHUB_TOKEN      optional; raises the GitHub search rate limit.
-  CENSUS_API_KEY    optional; adds US 1-bed rent, income and age to city profiles.
-  YOUTUBE_API_KEY   optional; adds geotagged-video counts to city profiles.
-  FLICKR_API_KEY    optional; adds geotagged-photo counts to city profiles.
+Every setting (CORS origins, refresh intervals, cache lifetimes, upstream URLs,
+optional API keys) is defined in config.py and can be overridden by environment variable.
 """
 
-import os
 import time
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
+import config
 import sources
 
 app = FastAPI(title="Population Globe API", version="0.2.0")
 
-origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5199").split(",") if o.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=config.ALLOWED_ORIGINS, allow_methods=["GET"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
@@ -50,7 +41,7 @@ async def health():
     return {
         "ok": True,
         "datasetCacheAgeSeconds": None if age is None else round(age),
-        "optionalKeys": {k: bool(os.getenv(k)) for k in ("GITHUB_TOKEN", "CENSUS_API_KEY", "YOUTUBE_API_KEY", "FLICKR_API_KEY")},
+        "optionalKeys": {k: bool(getattr(config, k)) for k in ("GITHUB_TOKEN", "CENSUS_API_KEY", "YOUTUBE_API_KEY", "FLICKR_API_KEY")},
     }
 
 
@@ -62,14 +53,16 @@ async def cities(response: Response):
         raise _upstream_error("City data", e)
     # The frontend adds a cache-busting `t` whenever /api/status reports newer data, so a
     # given URL always maps to one dataset version and can be cached by browser and CDN.
-    _cdn(response, sources.DATASET_TTL, browser=60)
+    _cdn(response, config.DATASET_TTL_SECONDS, browser=config.CITIES_BROWSER_TTL_SECONDS)
     return data
 
 
 @app.get("/api/status")
 async def status(response: Response):
     """When each upstream was last pulled and how often it refreshes. Polled by the frontend."""
-    response.headers["Cache-Control"] = "public, max-age=10, s-maxage=15"
+    response.headers["Cache-Control"] = (
+        f"public, max-age={config.STATUS_BROWSER_TTL_SECONDS}, s-maxage={config.STATUS_CDN_TTL_SECONDS}"
+    )
     return {"now": int(time.time()), "sources": sources.status()}
 
 
@@ -80,7 +73,7 @@ async def rent_history(response: Response):
         data = await sources.get_rent_history()
     except Exception as e:
         raise _upstream_error("Rent history", e)
-    _cdn(response, sources.DAY)
+    _cdn(response, config.DATASET_TTL_SECONDS)
     return data
 
 
@@ -94,7 +87,7 @@ async def live(feed: str, response: Response):
     except Exception as e:
         raise _upstream_error(feed, e)
     ttl = sources.FEEDS[feed][2]
-    _cdn(response, ttl, browser=min(ttl, 300))
+    _cdn(response, ttl, browser=min(ttl, config.FEED_BROWSER_MAX_TTL_SECONDS))
     return data
 
 
@@ -107,7 +100,7 @@ async def city_profile(geoname_id: int, response: Response):
         raise _upstream_error("City profile", e)
     if data is None:
         raise HTTPException(404, "Unknown city")
-    _cdn(response, 15 * sources.MINUTE)
+    _cdn(response, config.PROFILE_CDN_TTL_SECONDS)
     return data
 
 
@@ -120,5 +113,5 @@ async def city_amenities(geoname_id: int, response: Response):
         raise _upstream_error("OpenStreetMap Overpass", e)
     if data is None:
         raise HTTPException(404, "Unknown city")
-    _cdn(response, 30 * sources.DAY)
+    _cdn(response, config.AMENITIES_TTL_SECONDS)
     return data

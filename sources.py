@@ -10,6 +10,8 @@ Keyless:
 - Wikidata / Wikimedia  -> population, births, pageviews, geotagged photos
 - GitHub / Open-Meteo / Overpass -> developers, weather + air quality, amenities
 
+Every URL, interval and limit used here is defined in config.py.
+
 Key-gated (skipped when the env var is unset):
 - CENSUS_API_KEY, YOUTUBE_API_KEY, FLICKR_API_KEY, GITHUB_TOKEN (optional, raises limits)
 """
@@ -17,7 +19,6 @@ Key-gated (skipped when the env var is unset):
 import asyncio
 import csv
 import io
-import os
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -25,17 +26,13 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+import config
+from config import DAY, HOUR, MINUTE  # noqa: F401  (re-exported for main.py)
 from estimates import estimate_of_per_1k, estimate_rent, norm
 
-GEONAMES_URL = "https://download.geonames.org/export/dump/cities15000.zip"
-ZORI_URL = "https://files.zillowstatic.com/research/public_csvs/zori/City_zori_uc_sfrcondomfr_sm_month.csv"
-WIKIDATA_URL = "https://www.wikidata.org/w/api.php"
-# Wikimedia rejects generic client User-Agents. Set API_CONTACT (a URL or email for
-# your deployment) so upstream operators can reach you.
-USER_AGENT = "PopulationGlobeBot/0.1 (%s) python-httpx" % os.getenv("API_CONTACT", "local development build; no public URL yet")
-
-MIN_POP = 20_000
-MINUTE, HOUR, DAY = 60, 3600, 86_400
+GEONAMES_URL = config.URLS["geonames"]
+ZORI_URL = config.URLS["zillow"]
+WIKIDATA_URL = config.URLS["wikidata"]
 
 
 class TTLCache:
@@ -71,22 +68,22 @@ class TTLCache:
 cache = TTLCache()
 
 
-def _client(timeout: float = 30) -> httpx.AsyncClient:
+def _client(timeout: float = config.HTTP_TIMEOUT_SECONDS) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         timeout=timeout,
         follow_redirects=True,
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json, text/csv, */*;q=0.8"},
+        headers={"User-Agent": config.USER_AGENT, "Accept": "application/json, text/csv, */*;q=0.8"},
     )
 
 
-async def _get_json(url: str, params: dict | None = None, timeout: float = 30, headers: dict | None = None) -> Any:
+async def _get_json(url: str, params: dict | None = None, timeout: float = config.HTTP_TIMEOUT_SECONDS, headers: dict | None = None) -> Any:
     async with _client(timeout) as http:
         r = await http.get(url, params=params, headers=headers)
         r.raise_for_status()
         return r.json()
 
 
-async def _safe(coro: Awaitable[Any], timeout: float = 12) -> Any:
+async def _safe(coro: Awaitable[Any], timeout: float = config.PROFILE_PART_TIMEOUT_SECONDS) -> Any:
     """Await an optional sub-lookup; any failure or timeout becomes None."""
     try:
         return await asyncio.wait_for(coro, timeout)
@@ -115,7 +112,7 @@ def _zillow_keys(name: str, state: str) -> list[str]:
 
 async def fetch_zillow() -> dict[str, Any]:
     """Latest rent per city plus one value per year (same calendar month) since 2015."""
-    async with _client(60) as http:
+    async with _client(config.DOWNLOAD_TIMEOUT_SECONDS) as http:
         r = await http.get(ZORI_URL)
         r.raise_for_status()
     reader = csv.reader(io.StringIO(r.text))
@@ -132,8 +129,8 @@ async def fetch_zillow() -> dict[str, Any]:
     rents: dict[str, int] = {}
     series: dict[str, list[int | None]] = {}
     for row in reader:
-        # Accept a value from the last 3 months only, so discontinued series don't leak in.
-        floor = max(first, len(row) - 3)
+        # Accept a value from the last few months only, so discontinued series don't leak in.
+        floor = max(first, len(row) - config.ZILLOW_MAX_STALE_MONTHS)
         j = len(row) - 1
         while j >= floor and row[j] == "":
             j -= 1
@@ -153,7 +150,7 @@ async def fetch_zillow() -> dict[str, Any]:
 
 async def fetch_geonames() -> list[tuple]:
     """[(geonameid, name, cc, admin1, lat, lon, pop, tz)] sorted by population desc."""
-    async with _client(60) as http:
+    async with _client(config.DOWNLOAD_TIMEOUT_SECONDS) as http:
         r = await http.get(GEONAMES_URL)
         r.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
@@ -163,7 +160,7 @@ async def fetch_geonames() -> list[tuple]:
         f = line.split("\t")
         pop = int(f[14] or 0)
         # PPLX = section of a populated place (e.g. a borough) — skip to limit double counting.
-        if pop < MIN_POP or f[7] == "PPLX":
+        if pop < config.MIN_CITY_POPULATION or f[7] == "PPLX":
             continue
         out.append((int(f[0]), f[1], f[8], f[10], round(float(f[4]), 3), round(float(f[5]), 3), pop, f[17]))
     out.sort(key=lambda c: -c[6])
@@ -172,24 +169,19 @@ async def fetch_geonames() -> list[tuple]:
 
 # ───────────────────────── World Bank (country level) ─────────────────────────
 
-_WB = {
-    "birth": "SP.DYN.CBRT.IN",    # births per 1,000 people per year
-    "death": "SP.DYN.CDRT.IN",    # deaths per 1,000 people per year
-    "internet": "IT.NET.USER.ZS",  # % of population using the internet
-    "gdp": "NY.GDP.PCAP.CD",      # GDP per person, current US$
-}
+_WB = config.WORLD_BANK_INDICATORS
 
 
 async def _wb_indicator(code: str) -> dict[str, tuple[float, str]]:
     data = await _get_json(
-        f"https://api.worldbank.org/v2/country/all/indicator/{code}",
-        {"format": "json", "mrnev": 1, "per_page": 400}, timeout=40,
+        config.URLS["worldbank"].format(code=code),
+        {"format": "json", "mrnev": 1, "per_page": 400}, timeout=config.WORLD_BANK_TIMEOUT_SECONDS,
     )
     return {d["country"]["id"]: (d["value"], d["date"]) for d in data[1] if d.get("value") is not None}
 
 
 async def fetch_countries() -> dict[str, dict[str, Any]]:
-    results = await asyncio.gather(*(_safe(_wb_indicator(c), 45) for c in _WB.values()))
+    results = await asyncio.gather(*(_safe(_wb_indicator(c), config.WORLD_BANK_TIMEOUT_SECONDS + 5) for c in _WB.values()))
     out: dict[str, dict[str, Any]] = {}
     for field, table in zip(_WB, results):
         for cc, (value, year) in (table or {}).items():
@@ -258,9 +250,7 @@ async def _build_dataset() -> dict[str, Any]:
     }
 
 
-# How often the city dataset is re-pulled from GeoNames, Zillow and the World Bank.
-# GeoNames republishes daily and Zillow monthly, so anything under an hour re-downloads identical files.
-DATASET_TTL = int(os.getenv("DATASET_TTL_SECONDS", HOUR))
+DATASET_TTL = config.DATASET_TTL_SECONDS
 
 
 async def _dataset() -> dict[str, Any]:
@@ -282,7 +272,7 @@ async def get_city(gid: int) -> dict[str, Any] | None:
 # ───────────────────────── Live global feeds ─────────────────────────
 
 async def _earthquakes() -> dict[str, Any]:
-    d = await _get_json("https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson")
+    d = await _get_json(config.URLS["earthquakes"].format(feed=config.EARTHQUAKE_FEED))
     return {
         "source": "USGS",
         "rows": [  # [lon, lat, depthKm, magnitude, place, epochMs]
@@ -295,8 +285,9 @@ async def _earthquakes() -> dict[str, Any]:
 
 async def _events() -> dict[str, Any]:
     d = await _get_json(
-        "https://eonet.gsfc.nasa.gov/api/v3/events",
-        {"status": "open", "days": 30, "category": "wildfires,severeStorms,volcanoes"}, timeout=40,
+        config.URLS["events"],
+        {"status": "open", "days": config.EONET_DAYS, "category": config.EONET_CATEGORIES},
+        timeout=config.DOWNLOAD_TIMEOUT_SECONDS,
     )
     rows = []
     for e in d["events"]:
@@ -311,13 +302,13 @@ async def _events() -> dict[str, Any]:
 
 
 async def _aurora() -> dict[str, Any]:
-    d = await _get_json("https://services.swpc.noaa.gov/json/ovation_aurora_latest.json")
-    rows = [[lon - 360 if lon > 180 else lon, lat, v] for lon, lat, v in d["coordinates"] if v >= 8]
+    d = await _get_json(config.URLS["aurora"])
+    rows = [[lon - 360 if lon > 180 else lon, lat, v] for lon, lat, v in d["coordinates"] if v >= config.AURORA_MIN_PROBABILITY]
     return {"source": "NOAA SWPC OVATION", "forecastTime": d.get("Forecast Time"), "rows": rows}  # [lon, lat, 0-100]
 
 
 async def _aircraft() -> dict[str, Any]:
-    d = await _get_json("https://opensky-network.org/api/states/all", timeout=40)
+    d = await _get_json(config.URLS["aircraft"], timeout=config.DOWNLOAD_TIMEOUT_SECONDS)
     rows = [  # [lon, lat, headingDeg, speedMs, callsign, altitudeM]
         [s[5], s[6], round(s[10] or 0), round(s[9] or 0), (s[1] or "").strip(), round(s[13] or s[7] or 0)]
         for s in d.get("states") or []
@@ -332,18 +323,18 @@ def _tle_triples(text: str) -> list[list[str]]:
 
 
 async def _tle_group(group: str) -> list[list[str]]:
-    async with _client(60) as http:
-        r = await http.get("https://celestrak.org/NORAD/elements/gp.php", params={"GROUP": group, "FORMAT": "tle"})
+    async with _client(config.DOWNLOAD_TIMEOUT_SECONDS) as http:
+        r = await http.get(config.URLS["satellites"], params={"GROUP": group, "FORMAT": "tle"})
         r.raise_for_status()
     return _tle_triples(r.text)
 
 
 async def _satellites() -> dict[str, Any]:
     # CelesTrak answers 403 to a client that re-downloads a group within ~2 hours, so each
-    # group is cached for 6 hours on its own and a failed group is simply left out for now.
+    # group is cached on its own (config.TLE_GROUP_TTL_SECONDS) and a failed group is simply left out for now.
     stations, starlink = await asyncio.gather(
-        _safe(cache.get("tle:stations", 6 * HOUR, lambda: _tle_group("stations")), 60),
-        _safe(cache.get("tle:starlink", 6 * HOUR, lambda: _tle_group("starlink")), 60),
+        _safe(cache.get("tle:stations", config.TLE_GROUP_TTL_SECONDS, lambda: _tle_group(config.TLE_GROUPS["stations"])), config.DOWNLOAD_TIMEOUT_SECONDS),
+        _safe(cache.get("tle:starlink", config.TLE_GROUP_TTL_SECONDS, lambda: _tle_group(config.TLE_GROUPS["starlink"])), config.DOWNLOAD_TIMEOUT_SECONDS),
     )
     if stations is None and starlink is None:
         raise RuntimeError("CelesTrak unavailable")
@@ -352,22 +343,20 @@ async def _satellites() -> dict[str, Any]:
 
 
 async def _cables() -> dict[str, Any]:
-    d = await _get_json("https://www.submarinecablemap.com/api/v3/cable/cable-geo.json", timeout=40)
+    d = await _get_json(config.URLS["cables"], timeout=config.DOWNLOAD_TIMEOUT_SECONDS)
     for f in d["features"]:
         f["properties"] = {"name": f["properties"].get("name"), "color": f["properties"].get("color")}
     d["source"] = "TeleGeography Submarine Cable Map (CC BY-NC-SA 4.0)"
     return d
 
 
-# name -> (loader, in-process TTL seconds, CDN s-maxage seconds)
+_LOADERS: dict[str, Callable[[], Awaitable[Any]]] = {
+    "earthquakes": _earthquakes, "events": _events, "aurora": _aurora,
+    "aircraft": _aircraft, "satellites": _satellites, "cables": _cables,
+}
+# name -> (loader, in-process TTL seconds, CDN s-maxage seconds); lifetimes come from config.py
 FEEDS: dict[str, tuple[Callable[[], Awaitable[Any]], int, int]] = {
-    "earthquakes": (_earthquakes, MINUTE, MINUTE),
-    "events": (_events, 15 * MINUTE, 15 * MINUTE),
-    "aurora": (_aurora, 10 * MINUTE, 10 * MINUTE),
-    # Anonymous OpenSky allows roughly 100 global snapshots a day, hence 15 minutes.
-    "aircraft": (_aircraft, 15 * MINUTE, 15 * MINUTE),
-    "satellites": (_satellites, 10 * MINUTE, 30 * MINUTE),  # orbit data itself is cached 6 h per group
-    "cables": (_cables, 7 * DAY, 7 * DAY),
+    name: (loader, config.FEED_TTL[name], config.FEED_CDN_TTL[name]) for name, loader in _LOADERS.items()
 }
 
 
@@ -406,7 +395,7 @@ async def _wikidata(gid: int) -> dict[str, Any]:
     """Wikidata item for a GeoNames ID: latest population, people born there, Wikipedia pageviews."""
     out: dict[str, Any] = {"entity": None, "population": None, "populationAsOf": None,
                            "bornHere": None, "wikipedia": None, "pageviews30d": None}
-    async with _client(15) as http:
+    async with _client() as http:
         r = await http.get(WIKIDATA_URL, params={
             "action": "query", "list": "search", "srlimit": 1, "format": "json",
             "srsearch": f"haswbstatement:P1566={gid}",
@@ -452,9 +441,9 @@ async def _wikidata(gid: int) -> dict[str, Any]:
             if title:
                 out["wikipedia"] = title
                 end = datetime.now(timezone.utc) - timedelta(days=1)
-                start = end - timedelta(days=29)
+                start = end - timedelta(days=config.WIKIPEDIA_PAGEVIEW_DAYS - 1)
                 pv = await http.get(
-                    "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/user/"
+                    config.URLS["pageviews"] + "/"
                     f"{httpx.URL('/' + title.replace(' ', '_')).raw_path.decode()[1:].replace('/', '%2F')}"
                     f"/daily/{start:%Y%m%d}/{end:%Y%m%d}"
                 )
@@ -466,29 +455,30 @@ async def _wikidata(gid: int) -> dict[str, Any]:
 async def _github_developers(name: str) -> dict[str, Any]:
     """GitHub user accounts whose profile location mentions the city name."""
     headers = {"Accept": "application/vnd.github+json"}
-    if os.getenv("GITHUB_TOKEN"):
-        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
-    d = await _get_json("https://api.github.com/search/users",
+    if config.GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {config.GITHUB_TOKEN}"
+    d = await _get_json(config.URLS["github"],
                         {"q": f'location:"{name}" type:user', "per_page": 1}, headers=headers)
     return {"count": d["total_count"]}
 
 
 async def _commons_photos(lat: float, lon: float) -> dict[str, Any]:
-    """Geotagged Wikimedia Commons files within 10 km (the API caps both radius and count)."""
-    d = await _get_json("https://commons.wikimedia.org/w/api.php", {
-        "action": "query", "list": "geosearch", "gscoord": f"{lat}|{lon}", "gsradius": 10000,
-        "gslimit": 500, "gsnamespace": 6, "format": "json",
+    """Geotagged Wikimedia Commons files near the centre (the API caps both radius and count)."""
+    d = await _get_json(config.URLS["commons"], {
+        "action": "query", "list": "geosearch", "gscoord": f"{lat}|{lon}", "gsradius": config.COMMONS_RADIUS_METERS,
+        "gslimit": config.COMMONS_MAX_RESULTS, "gsnamespace": 6, "format": "json",
     })
     n = len(d.get("query", {}).get("geosearch", []))
-    return {"count": n, "capped": n >= 500}
+    return {"count": n, "capped": n >= config.COMMONS_MAX_RESULTS,
+            "radiusKm": round(config.COMMONS_RADIUS_METERS / 1000, 1)}
 
 
 async def _weather(lat: float, lon: float) -> dict[str, Any]:
     loc = {"latitude": lat, "longitude": lon}
     wx, aq = await asyncio.gather(
-        _safe(_get_json("https://api.open-meteo.com/v1/forecast",
+        _safe(_get_json(config.URLS["weather"],
                         {**loc, "current": "temperature_2m,weather_code,wind_speed_10m,is_day"})),
-        _safe(_get_json("https://air-quality-api.open-meteo.com/v1/air-quality",
+        _safe(_get_json(config.URLS["air_quality"],
                         {**loc, "current": "us_aqi,pm2_5"})),
     )
     if not wx and not aq:
@@ -502,21 +492,21 @@ async def _weather(lat: float, lon: float) -> dict[str, Any]:
 
 
 async def _youtube(lat: float, lon: float) -> dict[str, Any]:
-    after = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    d = await _get_json("https://www.googleapis.com/youtube/v3/search", {
-        "part": "id", "type": "video", "location": f"{lat},{lon}", "locationRadius": "20km",
-        "publishedAfter": after, "maxResults": 1, "key": os.environ["YOUTUBE_API_KEY"],
+    after = (datetime.now(timezone.utc) - timedelta(days=config.YOUTUBE_LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    d = await _get_json(config.URLS["youtube"], {
+        "part": "id", "type": "video", "location": f"{lat},{lon}", "locationRadius": f"{config.YOUTUBE_RADIUS_KM}km",
+        "publishedAfter": after, "maxResults": 1, "key": config.YOUTUBE_API_KEY,
     })
-    return {"videos7d": d.get("pageInfo", {}).get("totalResults")}
+    return {"videos": d.get("pageInfo", {}).get("totalResults"), "days": config.YOUTUBE_LOOKBACK_DAYS}
 
 
 async def _flickr(lat: float, lon: float) -> dict[str, Any]:
-    d = await _get_json("https://www.flickr.com/services/rest/", {
-        "method": "flickr.photos.search", "api_key": os.environ["FLICKR_API_KEY"], "lat": lat, "lon": lon,
-        "radius": 20, "min_upload_date": int(time.time()) - 30 * DAY, "per_page": 1,
+    d = await _get_json(config.URLS["flickr"], {
+        "method": "flickr.photos.search", "api_key": config.FLICKR_API_KEY, "lat": lat, "lon": lon,
+        "radius": config.FLICKR_RADIUS_KM, "min_upload_date": int(time.time()) - config.FLICKR_LOOKBACK_DAYS * DAY, "per_page": 1,
         "format": "json", "nojsoncallback": 1,
     })
-    return {"photos30d": int(d["photos"]["total"])}
+    return {"photos": int(d["photos"]["total"]), "days": config.FLICKR_LOOKBACK_DAYS}
 
 
 _STATE_FIPS = {
@@ -533,22 +523,22 @@ _PLACE_SUFFIXES = (" city", " town", " village", " borough", " cdp", " municipal
 
 async def _census_table() -> dict[str, dict[str, Any]]:
     """ACS 5-year: median 1-bedroom gross rent, household income and age for every US place."""
-    data = await _get_json("https://api.census.gov/data/2023/acs/acs5", {
+    data = await _get_json(config.URLS["census"].format(dataset=config.CENSUS_DATASET), {
         "get": "NAME,B25031_003E,B19013_001E,B01002_001E", "for": "place:*", "in": "state:*",
-        "key": os.environ["CENSUS_API_KEY"],
-    }, timeout=60)
+        "key": config.CENSUS_API_KEY,
+    }, timeout=config.DOWNLOAD_TIMEOUT_SECONDS)
     out = {}
     for name, rent, income, age, state, _place in data[1:]:
         place = norm(name.split(",")[0])
         for suffix in _PLACE_SUFFIXES:
             place = place.removesuffix(suffix)
         num = lambda v: float(v) if v not in (None, "") and float(v) > 0 else None  # negatives are "no data" codes
-        out.setdefault(f"{place.strip()}|{state}", {"rent1br": num(rent), "income": num(income), "medianAge": num(age), "survey": "ACS 2023 5-year"})
+        out.setdefault(f"{place.strip()}|{state}", {"rent1br": num(rent), "income": num(income), "medianAge": num(age), "survey": config.CENSUS_LABEL})
     return out
 
 
 async def _census(name: str, admin1: str) -> dict[str, Any] | None:
-    table = await cache.get("census", 30 * DAY, _census_table)
+    table = await cache.get("census", config.PROFILE_TTL["census"], _census_table)
     key = norm(name).removesuffix(" city")
     return table.get(f"{'new york' if key == 'new york' else key}|{_STATE_FIPS.get(admin1, '')}")
 
@@ -561,16 +551,16 @@ async def get_profile(gid: int) -> dict[str, Any] | None:
         return None
     name, lat, lon = city["name"], city["lat"], city["lon"]
     jobs = {
-        "wikidata": cache.get(f"wd:{gid}", 7 * DAY, lambda: _wikidata(gid)),
-        "github": cache.get(f"gh:{norm(name)}", 7 * DAY, lambda: _github_developers(name)),
-        "commons": cache.get(f"commons:{gid}", 7 * DAY, lambda: _commons_photos(lat, lon)),
-        "weather": cache.get(f"wx:{gid}", 15 * MINUTE, lambda: _weather(lat, lon)),
+        "wikidata": cache.get(f"wd:{gid}", config.PROFILE_TTL["wikidata"], lambda: _wikidata(gid)),
+        "github": cache.get(f"gh:{norm(name)}", config.PROFILE_TTL["github"], lambda: _github_developers(name)),
+        "commons": cache.get(f"commons:{gid}", config.PROFILE_TTL["commons"], lambda: _commons_photos(lat, lon)),
+        "weather": cache.get(f"wx:{gid}", config.PROFILE_TTL["weather"], lambda: _weather(lat, lon)),
     }
-    if os.getenv("YOUTUBE_API_KEY"):
-        jobs["youtube"] = cache.get(f"yt:{gid}", DAY, lambda: _youtube(lat, lon))
-    if os.getenv("FLICKR_API_KEY"):
-        jobs["flickr"] = cache.get(f"flickr:{gid}", DAY, lambda: _flickr(lat, lon))
-    if os.getenv("CENSUS_API_KEY") and city["cc"] == "US":
+    if config.YOUTUBE_API_KEY:
+        jobs["youtube"] = cache.get(f"yt:{gid}", config.PROFILE_TTL["youtube"], lambda: _youtube(lat, lon))
+    if config.FLICKR_API_KEY:
+        jobs["flickr"] = cache.get(f"flickr:{gid}", config.PROFILE_TTL["flickr"], lambda: _flickr(lat, lon))
+    if config.CENSUS_API_KEY and city["cc"] == "US":
         jobs["census"] = _census(name, city["admin1"])
     results = await asyncio.gather(*(_safe(j) for j in jobs.values()))
     return {"id": gid, **dict(zip(jobs, results))}
@@ -578,24 +568,18 @@ async def get_profile(gid: int) -> dict[str, Any] | None:
 
 # ───────────────────────── Amenities (OpenStreetMap) ─────────────────────────
 
-_AMENITIES = {
-    "bars": '["amenity"~"^(bar|pub)$"]',
-    "cafes": '["amenity"="cafe"]',
-    "nightclubs": '["amenity"="nightclub"]',
-    "gyms": '["leisure"="fitness_centre"]',
-    "coworking": '["amenity"="coworking_space"]',
-}
-_OVERPASS = ("https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter")
+_AMENITIES = config.AMENITY_FILTERS
+_OVERPASS = config.OVERPASS_URLS
 
 
 async def _amenities(lat: float, lon: float, radius: int) -> dict[str, Any]:
-    query = "[out:json][timeout:25];" + "".join(
+    query = f"[out:json][timeout:{config.OVERPASS_TIMEOUT_SECONDS}];" + "".join(
         f"nwr{sel}(around:{radius},{lat},{lon});out count;" for sel in _AMENITIES.values()
     )
     last: Exception | None = None
     for url in _OVERPASS:
         try:
-            async with _client(20) as http:
+            async with _client(config.OVERPASS_TIMEOUT_SECONDS) as http:
                 r = await http.post(url, data={"data": query})
                 r.raise_for_status()
             counts = [int(e["tags"]["total"]) for e in r.json()["elements"] if e.get("type") == "count"]
@@ -611,6 +595,7 @@ async def get_amenities(gid: int) -> dict[str, Any] | None:
     city = await get_city(gid)
     if not city:
         return None
-    # Search radius grows with city size: about 4 km for 100k people, 15 km for 10M.
-    radius = int(min(15000, max(4000, 3000 + 4 * city["pop"] ** 0.5)))
-    return await cache.get(f"osm:{gid}", 30 * DAY, lambda: _amenities(city["lat"], city["lon"], radius))
+    # Search radius grows with city size (see AMENITY_RADIUS_* in config.py).
+    grown = config.AMENITY_RADIUS_BASE_METERS + config.AMENITY_RADIUS_PER_SQRT_PERSON * city["pop"] ** 0.5
+    radius = int(min(config.AMENITY_RADIUS_MAX_METERS, max(config.AMENITY_RADIUS_MIN_METERS, grown)))
+    return await cache.get(f"osm:{gid}", config.AMENITIES_TTL_SECONDS, lambda: _amenities(city["lat"], city["lon"], radius))
