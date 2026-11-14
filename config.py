@@ -57,6 +57,7 @@ URLS = {
     "aurora": "https://services.swpc.noaa.gov/json/ovation_aurora_latest.json",
     "aircraft": "https://opensky-network.org/api/states/all",
     "aircraft_by_type": "https://api.adsb.lol/v2/type/{type}",
+    "airlines": "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airlines.dat",
     "satellites": "https://celestrak.org/NORAD/elements/gp.php",
     "cables": "https://www.submarinecablemap.com/api/v3/cable/cable-geo.json",
     "wikidata": "https://www.wikidata.org/w/api.php",
@@ -118,6 +119,10 @@ EONET_CATEGORIES = _str("EONET_CATEGORIES", "wildfires,severeStorms,volcanoes")
 EONET_DAYS = _int("EONET_DAYS", 30)
 # Aurora grid cells below this probability (%) are dropped.
 AURORA_MIN_PROBABILITY = _int("AURORA_MIN_PROBABILITY", 8)
+# Airline names come from the OpenFlights airline table (ODbL), matched on the three-letter
+# code at the start of a flight's callsign (DAL2635 -> Delta Air Lines).
+AIRLINES_TTL_SECONDS = _int("AIRLINES_TTL_SECONDS", 7 * DAY)
+
 # Aircraft sources, tried in order until one answers.
 #   opensky - every aircraft in one call, but it refuses connections from some cloud hosts (Vercel included).
 #   adsblol - works from cloud hosts; fetched one aircraft type at a time, so light aircraft are missed.

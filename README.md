@@ -19,7 +19,7 @@ Cache times below are the defaults from `config.py`.
 | `GET /api/live/earthquakes` | M2.5+ quakes, last 24 h | USGS | 1 min |
 | `GET /api/live/events` | open wildfires, severe storms, volcanoes | NASA EONET | 15 min |
 | `GET /api/live/aurora` | aurora probability grid | NOAA SWPC | 10 min |
-| `GET /api/live/aircraft` | airborne aircraft snapshot | OpenSky Network, falling back to adsb.lol | 15 min |
+| `GET /api/live/aircraft` | airborne aircraft with callsign, airline, type and registration | OpenSky Network or adsb.lol; airline names from OpenFlights | 15 min |
 | `GET /api/live/satellites` | orbit data for the ISS and Starlink | CelesTrak | 6 h per group |
 | `GET /api/live/cables` | submarine cables | TeleGeography | 7 days |
 | `GET /api/cities/{id}/profile` | Wikidata population, people born there, Wikipedia views, GitHub developers, Commons photos, weather, air quality | Wikidata, Wikimedia, GitHub, Open-Meteo | 15 min – 7 days per part |

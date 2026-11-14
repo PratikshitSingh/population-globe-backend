@@ -316,8 +316,8 @@ async def _aircraft_opensky() -> dict[str, Any]:
         r = await http.get(config.URLS["aircraft"])
         r.raise_for_status()
     d = r.json()
-    rows = [  # [lon, lat, headingDeg, speedMs, callsign, altitudeM]
-        [s[5], s[6], round(s[10] or 0), round(s[9] or 0), (s[1] or "").strip(), round(s[13] or s[7] or 0)]
+    rows = [  # [lon, lat, headingDeg, speedMs, callsign, altitudeM, aircraftType, registration]
+        [s[5], s[6], round(s[10] or 0), round(s[9] or 0), (s[1] or "").strip(), round(s[13] or s[7] or 0), None, None]
         for s in d.get("states") or []
         if s[5] is not None and s[6] is not None and not s[8]
     ]
@@ -352,6 +352,7 @@ async def _aircraft_adsblol() -> dict[str, Any]:
             round((ac.get("gs") or 0) * 0.514444),  # knots -> m/s
             (ac.get("flight") or "").strip(),
             round(alt_ft * 0.3048),                 # feet -> metres
+            ac.get("t"), ac.get("r"),
         ])
     return {
         "source": "adsb.lol (commonest airliner types only)", "time": int(time.time()), "rows": rows,
@@ -362,12 +363,39 @@ async def _aircraft_adsblol() -> dict[str, Any]:
 _AIRCRAFT_SOURCES = {"opensky": _aircraft_opensky, "adsblol": _aircraft_adsblol}
 
 
+async def _airline_table() -> dict[str, str]:
+    """ICAO airline code -> name, from OpenFlights. Active airlines win over defunct ones sharing a code."""
+    async with _client() as http:
+        r = await http.get(config.URLS["airlines"])
+        r.raise_for_status()
+    table: dict[str, tuple[bool, str]] = {}
+    for row in csv.reader(io.StringIO(r.text)):
+        if len(row) < 8:
+            continue
+        name, icao, active = row[1].strip(), row[4].strip().upper(), row[7] == "Y"
+        if len(icao) == 3 and icao.isalpha() and name and (icao not in table or (active and not table[icao][0])):
+            table[icao] = (active, name)
+    return {code: name for code, (_, name) in table.items()}
+
+
+def _airline_code(callsign: str) -> str | None:
+    """Airline flights use a three-letter airline code followed by a flight number (DAL2635).
+    Private aircraft use their registration as callsign, which doesn't fit that pattern."""
+    return callsign[:3] if len(callsign) > 3 and callsign[:3].isalpha() and callsign[3].isdigit() else None
+
+
 async def _aircraft() -> dict[str, Any]:
     """Tries each source in config.AIRCRAFT_SOURCES until one answers."""
     errors = []
     for name in config.AIRCRAFT_SOURCES:
         try:
-            return await _AIRCRAFT_SOURCES[name]()
+            data = await _AIRCRAFT_SOURCES[name]()
+            airlines = await _safe(cache.get("airlines", config.AIRLINES_TTL_SECONDS, _airline_table)) or {}
+            # -> [lon, lat, headingDeg, speedMs, callsign, altitudeM, aircraftType, registration, airline]
+            for row in data["rows"]:
+                row.append(airlines.get(_airline_code(row[4]) or ""))
+            data["airlineSource"] = "OpenFlights" if airlines else None
+            return data
         except Exception as e:
             errors.append(f"{name}: {type(e).__name__}: {str(e)[:120]}")
             logger.warning("aircraft source %s failed: %s", name, errors[-1])
