@@ -5,7 +5,7 @@ Keyless:
 - Zillow ZORI CSV       -> measured US city rents + history since 2015
 - World Bank            -> birth/death rates, internet use, GDP per person (by country)
 - USGS / NASA EONET / NOAA SWPC -> earthquakes, natural events, aurora
-- OpenSky / CelesTrak   -> aircraft, satellite orbits
+- OpenSky or adsb.lol / CelesTrak -> aircraft, satellite orbits
 - TeleGeography         -> submarine cables (CC BY-NC-SA)
 - Wikidata / Wikimedia  -> population, births, pageviews, geotagged photos
 - GitHub / Open-Meteo / Overpass -> developers, weather + air quality, amenities
@@ -19,6 +19,7 @@ Key-gated (skipped when the env var is unset):
 import asyncio
 import csv
 import io
+import logging
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -66,6 +67,7 @@ class TTLCache:
 
 
 cache = TTLCache()
+logger = logging.getLogger("population_globe")
 
 
 def _client(timeout: float = config.HTTP_TIMEOUT_SECONDS) -> httpx.AsyncClient:
@@ -307,14 +309,69 @@ async def _aurora() -> dict[str, Any]:
     return {"source": "NOAA SWPC OVATION", "forecastTime": d.get("Forecast Time"), "rows": rows}  # [lon, lat, 0-100]
 
 
-async def _aircraft() -> dict[str, Any]:
-    d = await _get_json(config.URLS["aircraft"], timeout=config.DOWNLOAD_TIMEOUT_SECONDS)
+async def _aircraft_opensky() -> dict[str, Any]:
+    """Every aircraft worldwide in one call. OpenSky refuses connections from some cloud hosts."""
+    timeout = httpx.Timeout(config.DOWNLOAD_TIMEOUT_SECONDS, connect=config.OPENSKY_CONNECT_TIMEOUT_SECONDS)
+    async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": config.USER_AGENT}) as http:
+        r = await http.get(config.URLS["aircraft"])
+        r.raise_for_status()
+    d = r.json()
     rows = [  # [lon, lat, headingDeg, speedMs, callsign, altitudeM]
         [s[5], s[6], round(s[10] or 0), round(s[9] or 0), (s[1] or "").strip(), round(s[13] or s[7] or 0)]
         for s in d.get("states") or []
         if s[5] is not None and s[6] is not None and not s[8]
     ]
     return {"source": "OpenSky Network", "time": d["time"], "rows": rows}
+
+
+async def _aircraft_adsblol() -> dict[str, Any]:
+    """adsb.lol has no "everything" endpoint, but it can list all aircraft of one type worldwide,
+    so the commonest airliner types are fetched and merged (the list is rate-limited to about ten).
+    Other airliners, freighters and light aircraft are missed."""
+    gate = asyncio.Semaphore(config.ADSBLOL_CONCURRENCY)
+
+    async def one(http: httpx.AsyncClient, code: str) -> list[dict]:
+        async with gate:
+            r = await http.get(config.URLS["aircraft_by_type"].format(type=code))
+            r.raise_for_status()
+            return r.json().get("ac") or []
+
+    async with _client() as http:
+        results = await asyncio.gather(*(one(http, t) for t in config.ADSBLOL_AIRCRAFT_TYPES), return_exceptions=True)
+    ok = [r for r in results if not isinstance(r, Exception)]
+    if not ok:
+        raise next(r for r in results if isinstance(r, Exception))
+    rows, seen = [], set()
+    for ac in (a for group in ok for a in group):
+        if ac.get("lat") is None or ac.get("lon") is None or ac.get("alt_baro") == "ground" or ac["hex"] in seen:
+            continue
+        seen.add(ac["hex"])
+        alt_ft = ac.get("alt_geom") or ac.get("alt_baro") or 0
+        rows.append([
+            ac["lon"], ac["lat"], round(ac.get("track") or 0),
+            round((ac.get("gs") or 0) * 0.514444),  # knots -> m/s
+            (ac.get("flight") or "").strip(),
+            round(alt_ft * 0.3048),                 # feet -> metres
+        ])
+    return {
+        "source": "adsb.lol (commonest airliner types only)", "time": int(time.time()), "rows": rows,
+        "typesFetched": len(ok), "typesFailed": len(results) - len(ok),
+    }
+
+
+_AIRCRAFT_SOURCES = {"opensky": _aircraft_opensky, "adsblol": _aircraft_adsblol}
+
+
+async def _aircraft() -> dict[str, Any]:
+    """Tries each source in config.AIRCRAFT_SOURCES until one answers."""
+    errors = []
+    for name in config.AIRCRAFT_SOURCES:
+        try:
+            return await _AIRCRAFT_SOURCES[name]()
+        except Exception as e:
+            errors.append(f"{name}: {type(e).__name__}: {str(e)[:120]}")
+            logger.warning("aircraft source %s failed: %s", name, errors[-1])
+    raise RuntimeError("; ".join(errors) or "no aircraft sources configured")
 
 
 def _tle_triples(text: str) -> list[list[str]]:

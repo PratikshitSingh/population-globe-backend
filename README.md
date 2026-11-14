@@ -19,7 +19,7 @@ Cache times below are the defaults from `config.py`.
 | `GET /api/live/earthquakes` | M2.5+ quakes, last 24 h | USGS | 1 min |
 | `GET /api/live/events` | open wildfires, severe storms, volcanoes | NASA EONET | 15 min |
 | `GET /api/live/aurora` | aurora probability grid | NOAA SWPC | 10 min |
-| `GET /api/live/aircraft` | airborne aircraft snapshot | OpenSky Network | 15 min |
+| `GET /api/live/aircraft` | airborne aircraft snapshot | OpenSky Network, falling back to adsb.lol | 15 min |
 | `GET /api/live/satellites` | orbit data for the ISS and Starlink | CelesTrak | 6 h per group |
 | `GET /api/live/cables` | submarine cables | TeleGeography | 7 days |
 | `GET /api/cities/{id}/profile` | Wikidata population, people born there, Wikipedia views, GitHub developers, Commons photos, weather, air quality | Wikidata, Wikimedia, GitHub, Open-Meteo | 15 min – 7 days per part |
@@ -44,6 +44,7 @@ settings win over the file without a code change. The ones you are most likely t
 | --- | --- | --- |
 | `ALLOWED_ORIGINS` | `http://localhost:5199` | Comma-separated frontend origins for CORS. |
 | `API_CONTACT` | placeholder | URL or email added to the User-Agent sent upstream. Wikimedia blocks clients that don't identify themselves. |
+| `AIRCRAFT_SOURCES` | `opensky,adsblol` | Aircraft sources tried in order. Use `adsblol` on Vercel. |
 | `DATASET_TTL_SECONDS` | `3600` | How often cities, rent and country stats are re-pulled. |
 | `FEED_TTL_<NAME>` | see `config.py` | Refresh interval for one live feed, e.g. `FEED_TTL_AIRCRAFT=300`. Names: `EARTHQUAKES`, `EVENTS`, `AURORA`, `AIRCRAFT`, `SATELLITES`, `CABLES`. |
 | `FEED_CDN_TTL_<NAME>` | see `config.py` | How long the CDN may serve that feed. |
@@ -57,11 +58,13 @@ settings win over the file without a code change. The ones you are most likely t
 
 ## Deploying to Vercel
 
-Import this repo as a project; Vercel should detect `app` in `main.py`. This has not been
-tested yet. Things to watch:
+Deployed at https://population-globe-backend.vercel.app. Vercel detects `app` in `main.py`
+with no extra configuration. Things to know:
 
-- OpenSky is known to refuse some cloud-provider IP ranges; the aircraft layer may need
-  OpenSky credentials or a different host.
+- OpenSky refuses connections from Vercel's servers, so set `AIRCRAFT_SOURCES=adsblol` there.
+  adsb.lol has no "all aircraft" endpoint and rate-limits at about 10 requests per window, so the
+  fallback fetches the ten commonest airliner types (`ADSBLOL_AIRCRAFT_TYPES`): roughly a third
+  to a half of what OpenSky shows, with no freighters or light aircraft.
 - CelesTrak returns 403 to a client that re-downloads the same group within about 2 hours.
   The 6-hour cache respects that, but cold starts on several instances could trip it.
 - The in-process cache is per instance and is lost on cold start; the CDN headers do most of the work.

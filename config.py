@@ -56,6 +56,7 @@ URLS = {
     "events": "https://eonet.gsfc.nasa.gov/api/v3/events",
     "aurora": "https://services.swpc.noaa.gov/json/ovation_aurora_latest.json",
     "aircraft": "https://opensky-network.org/api/states/all",
+    "aircraft_by_type": "https://api.adsb.lol/v2/type/{type}",
     "satellites": "https://celestrak.org/NORAD/elements/gp.php",
     "cables": "https://www.submarinecablemap.com/api/v3/cable/cable-geo.json",
     "wikidata": "https://www.wikidata.org/w/api.php",
@@ -117,6 +118,19 @@ EONET_CATEGORIES = _str("EONET_CATEGORIES", "wildfires,severeStorms,volcanoes")
 EONET_DAYS = _int("EONET_DAYS", 30)
 # Aurora grid cells below this probability (%) are dropped.
 AURORA_MIN_PROBABILITY = _int("AURORA_MIN_PROBABILITY", 8)
+# Aircraft sources, tried in order until one answers.
+#   opensky - every aircraft in one call, but it refuses connections from some cloud hosts (Vercel included).
+#   adsblol - works from cloud hosts; fetched one aircraft type at a time, so light aircraft are missed.
+# On Vercel set AIRCRAFT_SOURCES=adsblol to skip the OpenSky attempt.
+AIRCRAFT_SOURCES = _list("AIRCRAFT_SOURCES", "opensky,adsblol")
+# Give up on OpenSky quickly when it can't be reached, so the fallback isn't kept waiting.
+OPENSKY_CONNECT_TIMEOUT_SECONDS = _int("OPENSKY_CONNECT_TIMEOUT_SECONDS", 4)
+# ICAO type codes fetched from adsb.lol, one request each. adsb.lol answers 429 after roughly
+# 10 requests in a short window (measured 2026-11), so this list is the ten commonest airliners;
+# a longer list just gets the extra requests rejected.
+ADSBLOL_AIRCRAFT_TYPES = _list("ADSBLOL_AIRCRAFT_TYPES", "B738,A320,A321,A20N,A21N,B38M,A319,B77W,B789,A359")
+# How many adsb.lol requests run at once.
+ADSBLOL_CONCURRENCY = _int("ADSBLOL_CONCURRENCY", 5)
 # CelesTrak answers 403 to a client that re-downloads a group within about 2 hours.
 TLE_GROUP_TTL_SECONDS = _int("TLE_GROUP_TTL_SECONDS", 6 * HOUR)
 TLE_GROUPS = {"stations": "stations", "starlink": "starlink"}
